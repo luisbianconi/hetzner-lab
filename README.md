@@ -1,0 +1,238 @@
+<!-- LAB_STATUS_START -->
+![Lab Status](https://img.shields.io/badge/lab_status-inactive-red)
+![Workers](https://img.shields.io/badge/workers-0-blue)
+![Last Update](https://img.shields.io/badge/last_update-2026--06--28-lightgray)
+<!-- LAB_STATUS_END -->
+
+# Hetzner K3s Lab
+
+Laboratorio Terraform para criar um cluster K3s na Hetzner Cloud.
+
+O projeto provisiona uma rede privada, um node control-plane, workers opcionais,
+firewall, K3s, Cilium, Argo CD, Tailscale opcional e um workload Nginx de teste
+exposto via Gateway API.
+
+## O Que E Criado
+
+- 1 servidor master `k3s-master`
+- `worker_count` servidores worker `k3s-worker-N`
+- Servidores Hetzner Cloud `cx23` com Debian 13 em `nbg1`
+- Rede privada `k3s-private-net` com faixa `10.0.0.0/16`
+- Subnet cloud `10.0.0.0/24` em `eu-central`
+- Firewall `k3s-firewall`
+- Chave SSH gerenciada no Hetzner Cloud
+- Token K3s aleatorio via Terraform
+- Kubeconfig local em `~/.kube/config`
+
+## Bootstrap Do Cluster
+
+O master instala:
+
+- K3s server sem Flannel e sem Traefik
+- Cilium via Helm, com kube-proxy replacement, Hubble e Gateway API
+- Gateway API CRDs `standard` e `experimental`
+- Argo CD via Helm
+- Tailscale no host, quando `tailscale_auth_key` for informado
+- Tailscale Kubernetes Operator, quando as credenciais OAuth forem informadas
+- Nginx de teste no namespace `test`
+
+Os workers entram no cluster via IP privado do master (`10.0.0.2`) e usam
+senhas estaveis por node quando `worker_node_passwords` for configurado.
+
+## Estrutura
+
+- `providers.tf`: providers Terraform (`hetznercloud/hcloud` e `hashicorp/template`)
+- `variables.tf`: variaveis de entrada
+- `network.tf`: rede privada e subnet
+- `security.tf`: firewall
+- `servers.tf`: servidores master e workers
+- `data.tf`: templates cloud-init e descoberta do IP publico local
+- `main.tf`: espera do K3s, chave SSH, kubeconfig local e rDNS
+- `outputs.tf`: outputs do master e kubeconfig
+- `cloud_init_master.yml`: bootstrap do master
+- `cloud_init_worker.yml`: bootstrap dos workers
+- `fetch_kubeconfig.sh`: busca o kubeconfig no master e grava em `~/.kube/config`
+
+## Requisitos
+
+- Terraform 1.x
+- Conta e token da Hetzner Cloud
+- Chave SSH local em `~/.ssh/id_ed25519`
+- Conteudo da chave publica SSH para `ssh_public_key`
+- `bash`, `ssh` e `kubectl` na maquina local
+
+## Configuracao
+
+Crie ou edite `terraform.tfvars` com os valores do lab. Nao committe tokens,
+secrets, arquivos de state ou kubeconfig.
+
+Exemplo minimo:
+
+```hcl
+ssh_public_key = "ssh-ed25519 AAAA... usuario@maquina"
+worker_count   = 2
+
+argo_version   = "9.5.20"
+cilium_version = "1.19.4"
+```
+
+Informe o token da Hetzner Cloud como variavel sensivel, por exemplo:
+
+```bash
+export TF_VAR_hcloud_token="<HETZNER_CLOUD_TOKEN>"
+```
+
+Tambem e possivel colocar `hcloud_token` em `terraform.tfvars`, mas isso deixa o
+segredo em arquivo local e exige mais cuidado.
+
+## Variaveis Principais
+
+| Variavel | Padrao | Descricao |
+| --- | --- | --- |
+| `hcloud_token` | obrigatoria | Token da Hetzner Cloud |
+| `ssh_public_key` | obrigatoria | Conteudo da chave publica SSH |
+| `ssh_key_name` | `luisbianconi-key` | Nome da chave criada na Hetzner |
+| `worker_count` | `2` | Quantidade de workers |
+| `argo_version` | `""` | Versao do chart Helm do Argo CD |
+| `cilium_version` | `""` | Versao do chart Helm do Cilium |
+| `worker_node_passwords` | `[]` | Senhas estaveis por worker |
+| `tailscale_auth_key` | `""` | Auth key para o master entrar no tailnet |
+| `tailscale_master_hostname` | `k3s-master.echo-fish.ts.net` | Hostname usado no kubeconfig |
+| `tailscale_master_advertise_routes` | `["10.0.0.0/24", "172.16.0.0/16", "172.17.0.0/16"]` | Rotas anunciadas no Tailscale |
+| `tailscale_operator_oauth_client_id` | `""` | Client ID OAuth do operator |
+| `tailscale_operator_oauth_client_secret` | `""` | Client secret OAuth do operator |
+| `tailscale_nginx_hostname` | `nginx-test` | Hostname do ingress Tailscale de teste |
+
+## Uso
+
+Inicialize o Terraform:
+
+```bash
+terraform init
+```
+
+Revise o plano:
+
+```bash
+terraform plan
+```
+
+Crie o lab:
+
+```bash
+terraform apply
+```
+
+Depois do `apply`, o recurso `null_resource.write_local_kubeconfig` busca
+`/etc/rancher/k3s/k3s.yaml` no master via SSH e grava em:
+
+```text
+~/.kube/config
+```
+
+O endpoint do kubeconfig e reescrito para:
+
+```text
+https://<tailscale_master_hostname>:6443
+```
+
+Valide o cluster:
+
+```bash
+kubectl get nodes
+kubectl get pods -A
+kubectl get gatewayclass
+```
+
+## Acesso E Rede
+
+Regras publicas do firewall:
+
+- SSH (`22/tcp`) liberado apenas para o IP publico local detectado por `api.ipify.org`
+- Kubernetes API (`6443/tcp`) liberada apenas para o IP publico local detectado
+- HTTP (`80/tcp`) e HTTPS (`443/tcp`) liberados publicamente
+
+Regras privadas:
+
+- TCP e UDP entre nodes dentro da rede privada `10.0.0.0/16`
+- UDP `8472` dentro da rede privada
+
+O master recebe o IP privado fixo `10.0.0.2`. Os workers usam IPs privados
+atribuidos pela rede da Hetzner.
+
+## Tailscale Opcional
+
+Se `tailscale_auth_key` estiver vazio, o setup de Tailscale no master e ignorado.
+
+Para habilitar o master no tailnet:
+
+```hcl
+tailscale_auth_key = "tskey-auth-..."
+```
+
+Para instalar o Tailscale Kubernetes Operator:
+
+```hcl
+tailscale_operator_oauth_client_id     = "..."
+tailscale_operator_oauth_client_secret = "..."
+tailscale_nginx_hostname               = "nginx-test"
+```
+
+O kubeconfig local sempre usa `tailscale_master_hostname` como endpoint. Se voce
+nao for acessar a API via Tailscale/MagicDNS, ajuste essa variavel para um nome
+resolvivel ou edite o endpoint no kubeconfig depois do `apply`.
+
+## Scaling
+
+Altere `worker_count` para escalar os workers:
+
+```hcl
+worker_count = 0 # apenas master
+worker_count = 2 # lab padrao
+worker_count = 4 # mais capacidade para testes
+```
+
+Ao reduzir `worker_count`, Terraform destroi os workers excedentes.
+
+Para evitar problemas de identidade em recriacoes de workers, configure
+`worker_node_passwords` com uma senha por indice:
+
+```hcl
+worker_node_passwords = [
+  "senha-worker-1",
+  "senha-worker-2",
+]
+```
+
+## Outputs
+
+```bash
+terraform output
+```
+
+Outputs disponiveis:
+
+- `master_ip`: IP publico do master
+- `kubeconfig_path`: caminho declarado pelo Terraform
+- `kubeconfig_server_endpoint`: endpoint Kubernetes configurado
+
+Nota: o script atual grava o kubeconfig em `~/.kube/config`.
+
+## Limpeza
+
+Destrua os recursos gerenciados:
+
+```bash
+terraform destroy
+```
+
+Se necessario, remova manualmente entradas antigas de `~/.ssh/known_hosts` ou
+ajuste o kubeconfig local apos destruir e recriar o lab.
+
+## Cuidados
+
+- O Terraform state pode conter dados sensiveis
+- `terraform.tfvars`, tokens, auth keys e secrets OAuth nao devem ser commitados
+- O bootstrap baixa scripts e manifests externos durante o cloud-init
+- Versoes vazias de `argo_version` ou `cilium_version` podem quebrar comandos Helm;
+  prefira fixar versoes testadas

@@ -40,6 +40,10 @@ resource "random_password" "k3s_token" {
 resource "hcloud_ssh_key" "default" {
   name       = var.ssh_key_name
   public_key = var.ssh_public_key
+
+  labels = {
+    "lab" = "true"
+  }
 }
 
 resource "hcloud_rdns" "master_rdns" {

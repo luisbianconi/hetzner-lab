@@ -2,7 +2,7 @@
 resource "hcloud_server" "master" {
   name         = "k3s-master"
   server_type  = "cx23"
-  image        = "ubuntu-22.04"
+  image        = "debian-13"
   location     = "nbg1"
   ssh_keys     = [hcloud_ssh_key.default.id]
   firewall_ids = [hcloud_firewall.k3s_firewall.id]
@@ -19,6 +19,7 @@ resource "hcloud_server" "master" {
   }
 
   labels = {
+    "lab" = "true"
     "k3s_node_type" = "master"
     "k3s_token"     = random_password.k3s_token.result
   }
@@ -33,7 +34,7 @@ resource "hcloud_server" "worker" {
   count        = var.worker_count
   name         = "k3s-worker-${count.index + 1}"
   server_type  = "cx23"
-  image        = "ubuntu-22.04"
+  image        = "debian-13"
   location     = "nbg1"
   ssh_keys     = [hcloud_ssh_key.default.id]
   firewall_ids = [hcloud_firewall.k3s_firewall.id]
@@ -50,6 +51,7 @@ resource "hcloud_server" "worker" {
 
   labels = {
     "k3s_node_type" = "worker"
+    "lab" = "true"
   }
 
   depends_on = [

@@ -1,0 +1,58 @@
+name: Refresh Terraform State Artifact
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 3 1 * *"
+
+concurrency:
+  group: terraform-state
+  cancel-in-progress: false
+
+jobs:
+  refresh-state:
+    runs-on: ubuntu-latest
+
+    permissions:
+      actions: read
+      contents: read
+
+    steps:
+      - name: Download latest terraform state artifact
+        id: download-state
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          archive_url="$(gh api "/repos/${GITHUB_REPOSITORY}/actions/artifacts?name=terraform-state&per_page=100" --jq '.artifacts | map(select(.expired == false)) | sort_by(.created_at) | reverse | .[0].archive_download_url // empty')"
+
+          if [ -z "$archive_url" ]; then
+            echo "No terraform-state artifact found."
+            echo "skip_upload=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          curl -fsSL -H "Authorization: Bearer ${GH_TOKEN}" -H "Accept: application/vnd.github+json" "$archive_url" -o terraform-state.zip
+          mkdir -p state
+          unzip -o terraform-state.zip -d state
+
+          if [ ! -f state/terraform.tfstate ] && [ -f state/state/terraform.tfstate ]; then
+            mv state/state/terraform.tfstate state/terraform.tfstate
+          fi
+
+          if [ ! -f state/terraform.tfstate ]; then
+            echo "No terraform.tfstate found in artifact."
+            echo "skip_upload=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "skip_upload=false" >> "$GITHUB_OUTPUT"
+
+      - name: Re-upload terraform state artifact
+        if: steps.download-state.outputs.skip_upload != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: terraform-state
+          path: state/terraform.tfstate
+          retention-days: 90

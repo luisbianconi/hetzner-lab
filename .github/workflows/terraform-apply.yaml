@@ -1,0 +1,92 @@
+name: Deploy Infrastructure on Hetzner Cloud
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: terraform-state
+  cancel-in-progress: false
+
+permissions:
+  actions: write
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    environment:
+      name: lab
+
+    env:
+      TF_VAR_hcloud_token: ${{ secrets.HCLOUD_TOKEN }}
+      TF_VAR_worker_node_passwords: ${{ secrets.WORKER_NODE_PASSWORDS }}
+      TF_VAR_tailscale_auth_key: ${{ secrets.TAILSCALE_AUTH_KEY }}
+      TF_VAR_tailscale_operator_oauth_client_id: ${{ secrets.TAILSCALE_OPERATOR_OAUTH_CLIENT_ID }}
+      TF_VAR_tailscale_operator_oauth_client_secret: ${{ secrets.TAILSCALE_OPERATOR_OAUTH_CLIENT_SECRET }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download previous state
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          archive_url="$(gh api "/repos/${GITHUB_REPOSITORY}/actions/artifacts?name=terraform-state&per_page=100" --jq '.artifacts | map(select(.expired == false)) | sort_by(.created_at) | reverse | .[0].archive_download_url // empty')"
+
+          if [ -z "$archive_url" ]; then
+            echo "No previous terraform-state artifact found."
+            exit 0
+          fi
+
+          curl -fsSL -H "Authorization: Bearer ${GH_TOKEN}" -H "Accept: application/vnd.github+json" "$archive_url" -o terraform-state.zip
+          unzip -o terraform-state.zip
+
+          if [ ! -f terraform.tfstate ] && [ -f state/terraform.tfstate ]; then
+            mv state/terraform.tfstate terraform.tfstate
+          fi
+
+      - uses: hashicorp/setup-terraform@v3
+
+      - name: Configurar chave SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" | base64 -d > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keygen -y -f ~/.ssh/id_ed25519 >/dev/null
+
+      - run: terraform init
+
+      - run: terraform plan
+
+      - name: Apply infrastructure
+        id: terraform_apply
+        continue-on-error: true
+        run: terraform apply -auto-approve
+
+      - name: Trigger destroy after apply failure
+        if: ${{ steps.terraform_apply.outcome == 'failure' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh workflow run full-cleanup.yaml --ref "${GITHUB_REF_NAME}"
+          exit 1
+
+      - name: Set lab status active
+        run: |
+          workers="$(terraform state list | awk '/^hcloud_server.worker/ { count++ } END { print count + 0 }')"
+          bash .github/scripts/update-lab-status.sh active "$workers"
+
+          git config user.name "github-actions"
+          git config user.email "github-actions@github.com"
+          git add README.md
+          git commit -m "docs: set lab status active" || echo "No changes"
+          git push
+
+      - name: Upload state
+        uses: actions/upload-artifact@v4
+        with:
+          name: terraform-state
+          path: terraform.tfstate
+          retention-days: 90

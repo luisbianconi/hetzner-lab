@@ -1,0 +1,72 @@
+name: Full Cleanup of Infrastructure on Hetzner Cloud
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: terraform-state
+  cancel-in-progress: false
+
+permissions:
+  actions: write
+  contents: write
+
+jobs:
+  fullcleanup:
+    runs-on: ubuntu-latest
+    environment:
+      name: lab
+      
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hetznercloud/setup-hcloud@v2
+
+      - name: Delete Hetzner lab resources
+        env:
+          HCLOUD_TOKEN: ${{ secrets.HCLOUD_TOKEN }}
+        run: |
+          for id in $(hcloud server list --selector "lab=true" -o noheader -o columns=id); do
+            hcloud server delete "$id"
+          done
+
+          sleep 60
+
+          for id in $(hcloud firewall list --selector "lab=true" -o noheader -o columns=id); do
+            hcloud firewall delete "$id"
+          done
+
+          for id in $(hcloud network list --selector "lab=true" -o noheader -o columns=id); do
+            hcloud network delete "$id"
+          done
+
+          for id in $(hcloud ssh-key list --selector "lab=true" -o noheader -o columns=id); do
+            hcloud ssh-key delete "$id"
+          done
+
+      - name: Delete Terraform state artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          artifact_ids="$(gh api "/repos/${GITHUB_REPOSITORY}/actions/artifacts?name=terraform-state&per_page=100" --jq '.artifacts[].id')"
+
+          if [ -z "$artifact_ids" ]; then
+            echo "No terraform-state artifacts found."
+            exit 0
+          fi
+
+          for id in $artifact_ids; do
+            gh api --method DELETE "/repos/${GITHUB_REPOSITORY}/actions/artifacts/${id}"
+          done
+
+      - name: Set lab status inactive
+        run: |
+          bash .github/scripts/update-lab-status.sh inactive 0
+
+          git config user.name "github-actions"
+          git config user.email "github-actions@github.com"
+          git add README.md
+          git commit -m "docs: set lab status inactive" || echo "No changes"
+          git push

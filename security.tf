@@ -65,4 +65,9 @@ resource "hcloud_firewall" "k3s_firewall" {
       hcloud_network.private_net.ip_range
     ]
   }
+
+labels = {
+  lab = "true"
+}
+
 }
