@@ -1,0 +1,370 @@
+#cloud-config
+package_update: false
+package_upgrade: false
+
+write_files:
+  - path: /root/install_k3s.sh
+    permissions: '0755'
+    content: |
+      #!/bin/bash
+      set -e
+      
+      # Install k3s
+      PUBLIC_IP=$(curl -s http://169.254.169.254/hetzner/v1/metadata/public-ipv4)
+      PRIVATE_IP=$(curl -s http://169.254.169.254/hetzner/v1/metadata/private-networks | grep -oE '10\.[0-9]+\.[0-9]+\.[0-9]+' | head -n1)
+      
+      curl -sfL https://get.k3s.io | sh -s - server \
+        --token=${k3s_token} \
+        --cluster-cidr=172.16.0.0/16 \
+        --service-cidr=172.17.0.0/16 \
+        --flannel-backend=none \
+        --disable-network-policy \
+        --disable=traefik \
+        --node-ip=$PRIVATE_IP \
+        --node-external-ip=$PUBLIC_IP \
+        --bind-address=0.0.0.0 \
+        --advertise-address=$PRIVATE_IP \
+        --tls-san=${tailscale_master_hostname} \
+        --tls-san=$PRIVATE_IP \
+        --tls-san=$PUBLIC_IP
+
+      # Wait for k3s to be ready
+      while [ ! -f /etc/rancher/k3s/k3s.yaml ]; do
+        echo "Waiting for k3s server to be ready..."
+        sleep 5
+      done
+
+  - path: /root/install_tailscale.sh
+    permissions: '0755'
+    content: |
+      #!/bin/bash
+      set -e
+
+      TS_AUTH_KEY="${tailscale_auth_key}"
+
+      if [ -z "$TS_AUTH_KEY" ]; then
+        echo "Tailscale auth key is empty, skipping Tailscale setup."
+        exit 0
+      fi
+
+      curl -fsSL https://tailscale.com/install.sh | sh
+      systemctl enable --now tailscaled
+
+      tailscale up \
+        --authkey="$TS_AUTH_KEY" \
+        --hostname="k3s-master" \
+        --accept-dns=false \
+        --ssh \
+        --advertise-routes="${tailscale_master_advertise_routes}" || true
+
+      tailscale status || true
+
+  - path: /root/install_cilium.sh
+    permissions: '0755'
+    content: |
+      #!/bin/bash
+      set -e
+      
+      # Set PrivateIP
+      export PRIVATE_IP=$(curl -s http://169.254.169.254/hetzner/v1/metadata/private-networks | grep -oE '10\.[0-9]+\.[0-9]+\.[0-9]+' | head -n1)
+
+      # Set kubeconfig
+      export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+
+      # Public IP used as explicit Gateway address
+      PUBLIC_IP=$(curl -s http://169.254.169.254/hetzner/v1/metadata/public-ipv4)
+      
+      # Wait for kubectl to be ready
+      echo "Waiting for Kubernetes API server to be available..."
+      for i in {1..60}; do
+        if kubectl get nodes &> /dev/null; then
+          echo "Kubernetes API server is ready."
+          break
+        fi
+        echo "Attempt $i/60: Waiting for API server..."
+        sleep 5
+      done
+      
+      # Install Helm if not present
+      if ! command -v helm &> /dev/null
+      then
+          echo "Helm not found, installing..."
+          curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+      fi
+      
+      # Add Cilium repo
+      helm repo add cilium https://helm.cilium.io/
+      helm repo update
+
+      # Install Gateway API CRDs before Cilium so controller can register correctly.
+      # Cilium Gateway controller also requires GRPCRoute CRD.
+      kubectl apply -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.0.0/standard-install.yaml
+      kubectl apply -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.0.0/experimental-install.yaml
+      
+      # Install Cilium
+      echo "Installing Cilium..."
+      helm upgrade --install cilium cilium/cilium --version ${cilium_version} \
+        --namespace kube-system \
+        --set kubeProxyReplacement=true \
+        --set k8sServiceHost=$PRIVATE_IP \
+        --set k8sServicePort=6443 \
+        --set l7Proxy=true \
+        --set envoy.enabled=true \
+        --set gatewayAPI.enabled=true \
+        --set gatewayAPI.hostNetwork.enabled=true \
+        --set-string extraConfig.enable-gateway-api=true \
+        --set-string extraConfig.enable-envoy-config=true \
+        --set hubble.enabled=true \
+        --set hubble.relay.enabled=true \
+        --set hubble.ui.enabled=true \
+        --set operator.replicas=1 \
+        --set ipam.mode=kubernetes
+
+      # Restart operator to ensure Gateway API controller registration is refreshed
+      kubectl rollout restart deploy/cilium-operator -n kube-system
+      kubectl rollout status deploy/cilium-operator -n kube-system --timeout=300s
+      
+      echo "Waiting for Cilium to be ready..."
+      kubectl rollout status daemonset/cilium -n kube-system --timeout=600s
+      kubectl rollout status daemonset/cilium-envoy -n kube-system --timeout=600s
+
+      # Wait for GatewayClass to be created by Cilium
+      for i in {1..60}; do
+        if kubectl get gatewayclass cilium >/dev/null 2>&1; then
+          echo "GatewayClass cilium is available."
+          break
+        fi
+        echo "Attempt $i/60: waiting for GatewayClass cilium..."
+        sleep 2
+      done
+
+      # Fallback: create GatewayClass if Cilium did not auto-create it.
+      if ! kubectl get gatewayclass cilium >/dev/null 2>&1; then
+        kubectl apply -f - <<EOF
+      apiVersion: gateway.networking.k8s.io/v1
+      kind: GatewayClass
+      metadata:
+        name: cilium
+      spec:
+        controllerName: io.cilium/gateway-controller
+      EOF
+      fi
+
+      # Wait until GatewayClass is actively accepted by the controller.
+      for i in {1..60}; do
+        if kubectl get gatewayclass cilium -o jsonpath='{.status.conditions[?(@.type=="Accepted")].status}' 2>/dev/null | grep -q True; then
+          echo "GatewayClass cilium is accepted by controller."
+          break
+        fi
+        echo "Attempt $i/60: waiting for GatewayClass acceptance..."
+        sleep 2
+      done
+
+      if ! kubectl get gatewayclass cilium -o jsonpath='{.status.conditions[?(@.type=="Accepted")].status}' 2>/dev/null | grep -q True; then
+        echo "ERROR: GatewayClass cilium is still not accepted by any controller."
+        kubectl get gatewayclass cilium -o yaml || true
+        kubectl -n kube-system logs deploy/cilium-operator --tail=200 || true
+        exit 1
+      fi
+      
+      echo "Cilium installation completed."
+
+  - path: /root/install_argocd.sh
+    permissions: '0755'
+    content: |
+      #!/bin/bash
+      set -e
+
+      # Set kubeconfig
+      export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+
+      echo "Installing ArgoCD..."
+
+      # Add ArgoCD Helm repo
+      helm repo add argo https://argoproj.github.io/argo-helm
+      helm repo update
+
+      # Install ArgoCD using Helm
+      helm install argocd argo/argo-cd \
+        --namespace argocd \
+        --create-namespace \
+        --version ${argo_version}
+
+      echo "Waiting for ArgoCD to be ready..."
+      kubectl wait --for=condition=Ready pod --all -n argocd --timeout=300s
+
+      echo "ArgoCD installation completed."
+
+  - path: /root/install_tailscale_operator.sh
+    permissions: '0755'
+    content: |
+      #!/bin/bash
+      set -e
+
+      export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+
+      TS_OAUTH_CLIENT_ID="${tailscale_operator_oauth_client_id}"
+      TS_OAUTH_CLIENT_SECRET="${tailscale_operator_oauth_client_secret}"
+
+      if [ -z "$TS_OAUTH_CLIENT_ID" ] || [ -z "$TS_OAUTH_CLIENT_SECRET" ]; then
+        echo "Tailscale operator OAuth credentials are empty, skipping operator install."
+        exit 0
+      fi
+
+      kubectl create namespace tailscale --dry-run=client -o yaml | kubectl apply -f -
+
+      kubectl -n tailscale create secret generic operator-oauth \
+        --from-literal=client_id="$TS_OAUTH_CLIENT_ID" \
+        --from-literal=client_secret="$TS_OAUTH_CLIENT_SECRET" \
+        --dry-run=client -o yaml | kubectl apply -f -
+
+      helm repo add tailscale https://pkgs.tailscale.com/helmcharts
+      helm repo update
+
+      helm upgrade --install tailscale-operator tailscale/tailscale-operator \
+        --namespace tailscale
+        
+      # Waiting for tailscale deployment
+      kubectl wait --for=condition=available --timeout=60s deployment/operator -n tailscale
+
+  - path: /root/install_test_nginx.sh
+    permissions: '0755'
+    content: |
+      #!/bin/bash
+      set -e
+
+      # Set kubeconfig
+      export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+
+      # Public IP used as explicit Gateway address
+      PUBLIC_IP=$(curl -s http://169.254.169.254/hetzner/v1/metadata/public-ipv4)
+
+      echo "Installing test Nginx with Gateway API..."
+
+      # Wait for Gateway API CRDs to be available
+      for i in {1..60}; do
+        if kubectl get crd gateways.gateway.networking.k8s.io >/dev/null 2>&1 && \
+           kubectl get crd httproutes.gateway.networking.k8s.io >/dev/null 2>&1 && \
+           kubectl get crd grpcroutes.gateway.networking.k8s.io >/dev/null 2>&1; then
+          break
+        fi
+        echo "Attempt $i/60: waiting for Gateway API CRDs..."
+        sleep 2
+      done
+
+      # Create test namespace
+      kubectl create namespace test || echo "Namespace test already exists"
+
+      # Create Nginx deployment, ClusterIP service, Gateway, and HTTPRoute
+      kubectl apply -f - <<EOF
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: nginx-test
+        namespace: test
+      spec:
+        replicas: 1
+        selector:
+          matchLabels:
+            app: nginx-test
+        template:
+          metadata:
+            labels:
+              app: nginx-test
+          spec:
+            containers:
+            - name: nginx
+              image: nginx:latest
+              ports:
+              - containerPort: 80
+      ---
+      apiVersion: v1
+      kind: Service
+      metadata:
+        name: nginx-test
+        namespace: test
+      spec:
+        type: ClusterIP
+        ports:
+        - port: 80
+          targetPort: 80
+        selector:
+          app: nginx-test
+      ---
+      apiVersion: gateway.networking.k8s.io/v1
+      kind: Gateway
+      metadata:
+        name: test-gateway
+        namespace: test
+      spec:
+        gatewayClassName: cilium
+        addresses:
+        - type: IPAddress
+          value: $${PUBLIC_IP}
+        listeners:
+        - name: http
+          protocol: HTTP
+          port: 80
+          allowedRoutes:
+            namespaces:
+              from: Same
+      ---
+      apiVersion: gateway.networking.k8s.io/v1
+      kind: HTTPRoute
+      metadata:
+        name: nginx-route
+        namespace: test
+      spec:
+        parentRefs:
+        - name: test-gateway
+        rules:
+        - matches:
+          - path:
+              type: PathPrefix
+              value: /
+          backendRefs:
+          - name: nginx-test
+            port: 80
+      EOF
+
+      echo "Waiting for Nginx to be ready..."
+      kubectl wait --for=condition=Ready pod -l app=nginx-test -n test --timeout=300s || true
+
+      # Expose nginx over Tailscale Ingress (TLS via tailscale ingress class)
+      if kubectl -n tailscale get deployment tailscale-operator >/dev/null 2>&1 || kubectl -n tailscale get deployment operator >/dev/null 2>&1; then
+        kubectl apply -f - <<EOF
+      apiVersion: networking.k8s.io/v1
+      kind: Ingress
+      metadata:
+        name: nginx-tailscale-ingress
+        namespace: test
+        annotations:
+          tailscale.com/hostname: ${tailscale_nginx_hostname}
+      spec:
+        ingressClassName: tailscale
+        tls:
+        - hosts:
+          - ${tailscale_nginx_hostname}
+        rules:
+        - host: ${tailscale_nginx_hostname}
+          http:
+            paths:
+            - path: /
+              pathType: Prefix
+              backend:
+                service:
+                  name: nginx-test
+                  port:
+                    number: 80
+      EOF
+      fi
+
+      echo "Test Nginx with Gateway API installation completed."
+
+runcmd:
+  - /root/install_k3s.sh
+  - /root/install_tailscale.sh
+  - /root/install_cilium.sh
+  - /root/install_argocd.sh
+  - /root/install_tailscale_operator.sh
+  - /root/install_test_nginx.sh

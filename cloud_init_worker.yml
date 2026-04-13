@@ -1,0 +1,101 @@
+#cloud-config
+package_update: false
+package_upgrade: false
+
+write_files:
+  - path: /root/install_k3s_agent.sh
+    permissions: '0755'
+    content: |
+      #!/bin/bash
+      set -e
+
+      exec >> /var/log/k3s-worker-bootstrap.log 2>&1
+
+      echo "Starting worker bootstrap at $(date -Iseconds)"
+
+      # Get public IP from metadata
+      PUBLIC_IP=$(curl -sf http://169.254.169.254/hetzner/v1/metadata/public-ipv4)
+
+      # Resolve private IP reliably. Metadata can be briefly empty during early boot.
+      PRIVATE_IP=""
+      for i in {1..30}; do
+        PRIVATE_IP=$(curl -s http://169.254.169.254/hetzner/v1/metadata/private-networks | grep -oE '10\.[0-9]+\.[0-9]+\.[0-9]+' | head -n1)
+        if [ -n "$PRIVATE_IP" ]; then
+          echo "Detected private IP from metadata: $PRIVATE_IP"
+          break
+        fi
+
+        PRIVATE_IP=$(ip -4 route get ${master_private_ip} 2>/dev/null | grep -oE 'src 10\.[0-9]+\.[0-9]+\.[0-9]+' | awk '{print $2}' | head -n1)
+        if [ -n "$PRIVATE_IP" ]; then
+          echo "Detected private IP from routing table: $PRIVATE_IP"
+          break
+        fi
+
+        echo "Attempt $i/30: waiting for private network IP..."
+        sleep 2
+      done
+
+      if [ -z "$PRIVATE_IP" ]; then
+        echo "ERROR: could not determine worker private IP"
+        exit 1
+      fi
+
+      echo "Waiting for master to be ready..."
+      until curl -sfLk --connect-timeout 5 "https://${master_private_ip}:6443/ping"; do
+        sleep 5
+      done
+      echo "Master is ready."
+
+      # Clear stale local agent state from previous failed installs/rebuilds.
+      rm -rf /var/lib/rancher/k3s/agent || true
+      rm -f /etc/rancher/k3s/k3s-agent.yaml || true
+
+      if [ -n "${worker_node_password}" ]; then
+        mkdir -p /etc/rancher/node
+        printf '%s' "${worker_node_password}" > /etc/rancher/node/password
+        chmod 600 /etc/rancher/node/password
+        echo "Using configured stable node password for this worker."
+      else
+        rm -f /etc/rancher/node/password || true
+        echo "No stable worker password configured; using --with-node-id fallback mode."
+      fi
+
+      # Retry agent install because network/DNS can flap during first boot.
+      for i in {1..10}; do
+        if systemctl is-active --quiet k3s-agent; then
+          echo "k3s-agent already active."
+          break
+        fi
+
+        echo "Install attempt $i/10..."
+        if [ -n "${worker_node_password}" ]; then
+          INSTALL_CMD='curl -sfL https://get.k3s.io | K3S_URL="https://${master_private_ip}:6443" K3S_TOKEN="${k3s_token}" sh -s - agent --node-name="$(hostname -s)" --node-ip="$PRIVATE_IP" --node-external-ip="$PUBLIC_IP"'
+        else
+          INSTALL_CMD='curl -sfL https://get.k3s.io | K3S_URL="https://${master_private_ip}:6443" K3S_TOKEN="${k3s_token}" sh -s - agent --node-name="$(hostname -s)" --node-ip="$PRIVATE_IP" --node-external-ip="$PUBLIC_IP" --with-node-id'
+        fi
+
+        if eval "$INSTALL_CMD"; then
+          sleep 5
+          systemctl restart k3s-agent || true
+        fi
+
+        if systemctl is-active --quiet k3s-agent; then
+          echo "k3s-agent is running."
+          break
+        fi
+
+        echo "k3s-agent not active yet, retrying in 10s..."
+        sleep 10
+      done
+
+      if ! systemctl is-active --quiet k3s-agent; then
+        echo "ERROR: k3s-agent failed to start after retries."
+        systemctl status k3s-agent || true
+        journalctl -u k3s-agent --no-pager -n 200 || true
+        exit 1
+      fi
+
+      echo "Worker bootstrap finished successfully at $(date -Iseconds)"
+
+runcmd:
+  - /root/install_k3s_agent.sh

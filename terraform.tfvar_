@@ -1,0 +1,9 @@
+hcloud_token = ""
+ssh_public_key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILXOGIgccvtxS4bIkM67TUZDtOylI4JNe5Sib/B/Ro/n LuisBianconi"
+worker_node_passwords = [
+	"",
+	""
+]
+tailscale_auth_key = 
+tailscale_operator_oauth_client_id = 
+tailscale_operator_oauth_client_secret = 
