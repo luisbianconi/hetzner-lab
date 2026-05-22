@@ -361,6 +361,16 @@ write_files:
 
       echo "Test Nginx with Gateway API installation completed."
 
+  - path: /root/end_configuration.sh
+    permissions: '0755'
+    content: |
+      #!/bin/bash
+      set -e
+      
+      # Disable controlplane endpoint on master to prevent accidental workloads being scheduled there
+      kubectl taint node --all node-role.kubernetes.io/control-plane:NoSchedule || true
+      echo "Cloud-init configuration completed successfully."
+
 runcmd:
   - /root/install_k3s.sh
   - /root/install_tailscale.sh
@@ -368,3 +378,4 @@ runcmd:
   - /root/install_argocd.sh
   - /root/install_tailscale_operator.sh
   - /root/install_test_nginx.sh
+  - /root/end_configuration.sh
